@@ -497,6 +497,38 @@ pub struct Options {
 
     #[arg(
         long,
+        env = "P_EXACT_INDEX_FIELDS",
+        value_delimiter = ',',
+        help = "Comma-separated field names to store bounded exact-value manifest indexes for"
+    )]
+    pub exact_index_fields: Vec<String>,
+
+    #[arg(
+        long,
+        env = "P_EXACT_INDEX_MAX_VALUES",
+        default_value = "4096",
+        help = "Maximum distinct values per file and field for exact-value manifest indexes"
+    )]
+    pub exact_index_max_values: usize,
+
+    #[arg(
+        long,
+        env = "P_TEXT_INDEX_FIELDS",
+        value_delimiter = ',',
+        help = "Comma-separated text field names to store bounded trigram manifest indexes for LIKE pruning"
+    )]
+    pub text_index_fields: Vec<String>,
+
+    #[arg(
+        long,
+        env = "P_TEXT_INDEX_MAX_TERMS",
+        default_value = "65536",
+        help = "Maximum distinct trigrams per file and field for text manifest indexes"
+    )]
+    pub text_index_max_terms: usize,
+
+    #[arg(
+        long,
         env = "P_MAX_EVENT_PAYLOAD_SIZE",
         default_value = "10485760",
         value_parser = validation::validate_payload_size,

@@ -157,7 +157,10 @@ impl StandardTableProvider {
 
         let mut conf_builder = FileScanConfigBuilder::new(object_store_url, file_source.into())
             .with_statistics(statistics)
-            .with_batch_size(Some(20000))
+            .with_batch_size(Some(parquet_scan_batch_size(
+                PARSEABLE.options.execution_batch_size,
+                limit,
+            )))
             .with_constraints(Constraints::default())
             .with_file_groups(file_groups)
             .with_output_ordering(vec![LexOrdering::new([sort_expr]).unwrap()]);
@@ -964,6 +967,17 @@ pub trait ManifestExt: ManifestFile {
             Some((expr.op, value))
         }
 
+        if let Some((column_name, pattern, escape_char)) = extract_like_pattern(partial_filter)
+            && let Some(col) = self.columns().iter().find(|col| col.name == column_name)
+            && let Some(text_ngrams) = &col.text_ngrams
+            && text_ngrams.complete
+        {
+            let grams = like_literal_trigrams(pattern, escape_char);
+            if !grams.is_empty() && grams.iter().any(|gram| !text_ngrams.contains(gram)) {
+                return true;
+            }
+        }
+
         let Some(col) = self.find_matching_column(partial_filter) else {
             return false;
         };
@@ -976,6 +990,14 @@ pub trait ManifestExt: ManifestFile {
             return false;
         };
 
+        if matches!(op, Operator::Eq | Operator::IsNotDistinctFrom)
+            && let Some(exact_values) = &col.exact_values
+            && exact_values.complete
+            && !exact_values.contains(&value.exact_index_key())
+        {
+            return true;
+        }
+
         let Some(stats) = &col.stats else {
             return false;
         };
@@ -986,11 +1008,89 @@ pub trait ManifestExt: ManifestFile {
 
 impl<T: ManifestFile> ManifestExt for T {}
 
+fn parquet_scan_batch_size(configured: usize, limit: Option<usize>) -> usize {
+    let configured = configured.max(1);
+    match limit {
+        Some(limit) => configured.min(limit.max(1024)),
+        None => configured,
+    }
+}
+
+fn extract_like_pattern(expr: &Expr) -> Option<(&str, &str, Option<char>)> {
+    let Expr::Like(like) = expr else {
+        return None;
+    };
+    if like.negated {
+        return None;
+    }
+
+    let Expr::Column(col) = like.expr.as_ref() else {
+        return None;
+    };
+    let pattern = match like.pattern.as_ref() {
+        Expr::Literal(ScalarValue::Utf8(Some(pattern)), None)
+        | Expr::Literal(ScalarValue::LargeUtf8(Some(pattern)), None)
+        | Expr::Literal(ScalarValue::Utf8View(Some(pattern)), None) => pattern,
+        _ => {
+            return None;
+        }
+    };
+
+    Some((&col.name, pattern, like.escape_char))
+}
+
+fn like_literal_trigrams(pattern: &str, escape_char: Option<char>) -> Vec<String> {
+    let mut grams = Vec::new();
+    let mut literal = String::new();
+    let mut escaped = false;
+
+    for ch in pattern.chars() {
+        if escape_char == Some(ch) && !escaped {
+            escaped = true;
+            continue;
+        }
+
+        if !escaped && matches!(ch, '%' | '_') {
+            push_literal_trigrams(&literal, &mut grams);
+            literal.clear();
+            continue;
+        }
+
+        literal.push(ch);
+        escaped = false;
+    }
+    push_literal_trigrams(&literal, &mut grams);
+    grams.sort();
+    grams.dedup();
+    grams
+}
+
+fn push_literal_trigrams(literal: &str, grams: &mut Vec<String>) {
+    let chars = literal.to_lowercase().chars().collect::<Vec<_>>();
+    if chars.len() < 3 {
+        return;
+    }
+
+    grams.extend(chars.windows(3).map(|window| window.iter().collect()));
+}
+
+#[derive(Clone, Copy)]
 enum CastRes<'a> {
     Bool(bool),
     Int(i64),
     Float(f64),
     String(&'a str),
+}
+
+impl CastRes<'_> {
+    fn exact_index_key(self) -> String {
+        match self {
+            Self::Bool(value) => value.to_string(),
+            Self::Int(value) => value.to_string(),
+            Self::Float(value) => value.to_string(),
+            Self::String(value) => value.to_string(),
+        }
+    }
 }
 
 fn cast_or_none(scalar: &ScalarValue) -> Option<CastRes<'_>> {
@@ -1053,9 +1153,16 @@ mod tests {
         scalar::ScalarValue,
     };
 
-    use crate::catalog::snapshot::ManifestItem;
+    use crate::catalog::{
+        column::{Column, ExactValues, TextNgrams, TypedStatistics, Utf8Type},
+        manifest::File,
+        snapshot::ManifestItem,
+    };
 
-    use super::{PartialTimeFilter, extract_timestamp_bound, is_overlapping_query};
+    use super::{
+        ManifestExt, PartialTimeFilter, extract_timestamp_bound, is_overlapping_query,
+        like_literal_trigrams, parquet_scan_batch_size,
+    };
 
     fn datetime_min(year: i32, month: u32, day: u32) -> DateTime<Utc> {
         NaiveDate::from_ymd_opt(year, month, day)
@@ -1099,6 +1206,127 @@ mod tests {
                 storage_size: 0,
             },
         ]
+    }
+
+    fn exact_index_filter(value: &str) -> Expr {
+        Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(Expr::Column("trace_id".into())),
+            Operator::Eq,
+            Box::new(Expr::Literal(
+                ScalarValue::Utf8(Some(value.to_string())),
+                None,
+            )),
+        ))
+    }
+
+    fn exact_index_file(values: &[&str], complete: bool) -> File {
+        let mut values = values
+            .iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>();
+        values.sort();
+
+        File {
+            file_path: "file.parquet".to_string(),
+            num_rows: 10,
+            file_size: 10,
+            ingestion_size: 10,
+            columns: vec![Column {
+                name: "trace_id".to_string(),
+                stats: Some(TypedStatistics::String(Utf8Type {
+                    min: "a".to_string(),
+                    max: "z".to_string(),
+                })),
+                exact_values: Some(ExactValues { complete, values }),
+                text_ngrams: None,
+                uncompressed_size: 10,
+                compressed_size: 10,
+            }],
+            sort_order_id: Vec::new(),
+        }
+    }
+
+    fn like_filter(pattern: &str) -> Expr {
+        Expr::Like(datafusion::logical_expr::Like::new(
+            false,
+            Box::new(Expr::Column("body".into())),
+            Box::new(Expr::Literal(
+                ScalarValue::Utf8(Some(pattern.to_string())),
+                None,
+            )),
+            None,
+            false,
+        ))
+    }
+
+    fn text_ngram_file(grams: &[&str], complete: bool) -> File {
+        let mut grams = grams
+            .iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>();
+        grams.sort();
+
+        File {
+            file_path: "file.parquet".to_string(),
+            num_rows: 10,
+            file_size: 10,
+            ingestion_size: 10,
+            columns: vec![Column {
+                name: "body".to_string(),
+                stats: None,
+                exact_values: None,
+                text_ngrams: Some(TextNgrams { complete, grams }),
+                uncompressed_size: 10,
+                compressed_size: 10,
+            }],
+            sort_order_id: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn exact_index_prunes_missing_equality_inside_min_max_range() {
+        let file = exact_index_file(&["a", "z"], true);
+
+        assert!(file.can_be_pruned(&exact_index_filter("m")));
+        assert!(!file.can_be_pruned(&exact_index_filter("a")));
+    }
+
+    #[test]
+    fn incomplete_exact_index_does_not_prune() {
+        let file = exact_index_file(&["a", "z"], false);
+
+        assert!(!file.can_be_pruned(&exact_index_filter("m")));
+    }
+
+    #[test]
+    fn text_ngram_index_prunes_like_when_required_trigram_missing() {
+        let file = text_ngram_file(&["ups", "pst", "str", "tre", "rea", "eam"], true);
+
+        assert!(file.can_be_pruned(&like_filter("%definitely_not_present_token%")));
+        assert!(!file.can_be_pruned(&like_filter("%upstream%")));
+    }
+
+    #[test]
+    fn incomplete_text_ngram_index_does_not_prune_like() {
+        let file = text_ngram_file(&["ups"], false);
+
+        assert!(!file.can_be_pruned(&like_filter("%definitely_not_present_token%")));
+    }
+
+    #[test]
+    fn like_literal_trigrams_respects_wildcards_and_escapes() {
+        assert_eq!(like_literal_trigrams("%cart_id%", None)[0], "art");
+        assert!(like_literal_trigrams("%ab%", None).is_empty());
+        assert!(like_literal_trigrams(r"%abc\_def%", Some('\\')).contains(&"c_d".to_string()));
+    }
+
+    #[test]
+    fn parquet_batch_size_uses_smaller_limit_aware_batches() {
+        assert_eq!(parquet_scan_batch_size(20_000, Some(100)), 1024);
+        assert_eq!(parquet_scan_batch_size(20_000, Some(4096)), 4096);
+        assert_eq!(parquet_scan_batch_size(512, Some(100)), 512);
+        assert_eq!(parquet_scan_batch_size(20_000, None), 20_000);
+        assert_eq!(parquet_scan_batch_size(0, Some(100)), 1);
     }
 
     #[test]

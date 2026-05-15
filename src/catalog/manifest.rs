@@ -16,17 +16,46 @@
  *
  */
 
-use std::collections::HashMap;
+use std::{
+    collections::{BTreeSet, HashMap, HashSet},
+    path::Path,
+};
 
+use arrow_array::{
+    Array, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
+    LargeStringArray, StringArray, StringViewArray, UInt8Array, UInt16Array, UInt32Array,
+    UInt64Array,
+};
+use arrow_schema::DataType;
 use itertools::Itertools;
-use parquet::file::{
-    metadata::{RowGroupMetaData, SortingColumn},
-    reader::FileReader,
+use parquet::{
+    arrow::{ProjectionMask, arrow_reader::ParquetRecordBatchReaderBuilder},
+    file::{
+        metadata::{RowGroupMetaData, SortingColumn},
+        reader::FileReader,
+    },
 };
 
 use crate::metastore::metastore_traits::MetastoreObject;
 
-use super::column::Column;
+use super::column::{Column, ExactValues, TextNgrams};
+
+const EXACT_INDEX_FIELDS_ENV: &str = "P_EXACT_INDEX_FIELDS";
+const EXACT_INDEX_MAX_VALUES_ENV: &str = "P_EXACT_INDEX_MAX_VALUES";
+const DEFAULT_EXACT_INDEX_MAX_VALUES: usize = 4096;
+const TEXT_INDEX_FIELDS_ENV: &str = "P_TEXT_INDEX_FIELDS";
+const TEXT_INDEX_MAX_TERMS_ENV: &str = "P_TEXT_INDEX_MAX_TERMS";
+const DEFAULT_TEXT_INDEX_MAX_TERMS: usize = 65_536;
+
+struct ExactIndexConfig {
+    fields: Vec<String>,
+    max_values: usize,
+}
+
+struct TextIndexConfig {
+    fields: Vec<String>,
+    max_terms: usize,
+}
 
 #[derive(
     Debug,
@@ -124,7 +153,41 @@ pub fn create_from_parquet_file(
         .iter()
         .fold(0, |acc, x| acc + x.total_byte_size() as u64);
 
-    let columns = column_statistics(row_groups);
+    let mut columns = column_statistics(row_groups);
+    if let Some(config) = exact_index_config_from_env() {
+        match exact_value_statistics(fs_file_path, &config.fields, config.max_values) {
+            Ok(exact_indexes) => {
+                for (name, exact_values) in exact_indexes {
+                    if let Some(column) = columns.get_mut(&name) {
+                        column.exact_values = Some(exact_values);
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "failed to collect exact-value manifest indexes for {:?}: {err}",
+                    fs_file_path
+                );
+            }
+        }
+    }
+    if let Some(config) = text_index_config_from_env() {
+        match text_ngram_statistics(fs_file_path, &config.fields, config.max_terms) {
+            Ok(text_indexes) => {
+                for (name, text_ngrams) in text_indexes {
+                    if let Some(column) = columns.get_mut(&name) {
+                        column.text_ngrams = Some(text_ngrams);
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "failed to collect text-ngram manifest indexes for {:?}: {err}",
+                    fs_file_path
+                );
+            }
+        }
+    }
     manifest_file.columns = columns.into_values().collect();
     let mut sort_orders = sort_order(row_groups);
     if let Some(last_sort_order) = sort_orders.pop()
@@ -190,6 +253,8 @@ fn column_statistics(row_groups: &[RowGroupMetaData]) -> HashMap<String, Column>
                     Column {
                         name: col_name,
                         stats: col.statistics().and_then(|stats| stats.try_into().ok()),
+                        exact_values: None,
+                        text_ngrams: None,
                         uncompressed_size: col.uncompressed_size() as u64,
                         compressed_size: col.compressed_size() as u64,
                     },
@@ -198,4 +263,378 @@ fn column_statistics(row_groups: &[RowGroupMetaData]) -> HashMap<String, Column>
         }
     }
     columns
+}
+
+fn exact_index_config_from_env() -> Option<ExactIndexConfig> {
+    let fields = std::env::var(EXACT_INDEX_FIELDS_ENV).ok()?;
+    let fields: Vec<_> = fields
+        .split(',')
+        .map(str::trim)
+        .filter(|field| !field.is_empty())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(ToOwned::to_owned)
+        .collect();
+
+    if fields.is_empty() {
+        return None;
+    }
+
+    let max_values = std::env::var(EXACT_INDEX_MAX_VALUES_ENV)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(DEFAULT_EXACT_INDEX_MAX_VALUES);
+
+    (max_values > 0).then_some(ExactIndexConfig { fields, max_values })
+}
+
+fn text_index_config_from_env() -> Option<TextIndexConfig> {
+    let fields = std::env::var(TEXT_INDEX_FIELDS_ENV).ok()?;
+    let fields: Vec<_> = fields
+        .split(',')
+        .map(str::trim)
+        .filter(|field| !field.is_empty())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(ToOwned::to_owned)
+        .collect();
+
+    if fields.is_empty() {
+        return None;
+    }
+
+    let max_terms = std::env::var(TEXT_INDEX_MAX_TERMS_ENV)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(DEFAULT_TEXT_INDEX_MAX_TERMS);
+
+    (max_terms > 0).then_some(TextIndexConfig { fields, max_terms })
+}
+
+fn exact_value_statistics(
+    fs_file_path: &Path,
+    fields: &[String],
+    max_values: usize,
+) -> anyhow::Result<HashMap<String, ExactValues>> {
+    let file = std::fs::File::open(fs_file_path)?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+    let schema = builder.schema();
+    let projected_indices: Vec<_> = fields
+        .iter()
+        .filter_map(|field| schema.index_of(field).ok())
+        .collect();
+
+    if projected_indices.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let projection = ProjectionMask::roots(builder.parquet_schema(), projected_indices);
+    let mut reader = builder.with_projection(projection).build()?;
+    let mut values_by_field: HashMap<String, BTreeSet<String>> = fields
+        .iter()
+        .map(|field| (field.clone(), BTreeSet::new()))
+        .collect();
+    let mut complete_by_field: HashMap<String, bool> =
+        fields.iter().map(|field| (field.clone(), true)).collect();
+    let mut seen_fields = HashSet::new();
+
+    for batch in &mut reader {
+        let batch = batch?;
+        let schema = batch.schema();
+        for (idx, field) in schema.fields().iter().enumerate() {
+            let name = field.name();
+            if !complete_by_field
+                .get(name.as_str())
+                .copied()
+                .unwrap_or(false)
+            {
+                continue;
+            }
+
+            seen_fields.insert(name.clone());
+            let Some(values) = values_by_field.get_mut(name.as_str()) else {
+                continue;
+            };
+
+            if !collect_exact_values(batch.column(idx).as_ref(), values, max_values) {
+                values.clear();
+                complete_by_field.insert(name.clone(), false);
+            }
+        }
+    }
+
+    Ok(values_by_field
+        .into_iter()
+        .filter_map(|(name, values)| {
+            if seen_fields.contains(&name) && complete_by_field.get(&name).copied().unwrap_or(false)
+            {
+                Some((
+                    name,
+                    ExactValues {
+                        complete: true,
+                        values: values.into_iter().collect(),
+                    },
+                ))
+            } else {
+                None
+            }
+        })
+        .collect())
+}
+
+fn collect_exact_values(
+    array: &dyn Array,
+    values: &mut BTreeSet<String>,
+    max_values: usize,
+) -> bool {
+    for idx in 0..array.len() {
+        if array.is_null(idx) {
+            continue;
+        }
+
+        let Some(value) = exact_value_from_array(array, idx) else {
+            return false;
+        };
+        values.insert(value);
+
+        if values.len() > max_values {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn exact_value_from_array(array: &dyn Array, idx: usize) -> Option<String> {
+    macro_rules! downcast_value {
+        ($array_ty:ty) => {
+            array
+                .as_any()
+                .downcast_ref::<$array_ty>()
+                .map(|array| array.value(idx).to_string())
+        };
+    }
+
+    match array.data_type() {
+        DataType::Utf8 => downcast_value!(StringArray),
+        DataType::LargeUtf8 => downcast_value!(LargeStringArray),
+        DataType::Utf8View => downcast_value!(StringViewArray),
+        DataType::Boolean => downcast_value!(BooleanArray),
+        DataType::Int8 => downcast_value!(Int8Array),
+        DataType::Int16 => downcast_value!(Int16Array),
+        DataType::Int32 => downcast_value!(Int32Array),
+        DataType::Int64 => downcast_value!(Int64Array),
+        DataType::UInt8 => downcast_value!(UInt8Array),
+        DataType::UInt16 => downcast_value!(UInt16Array),
+        DataType::UInt32 => downcast_value!(UInt32Array),
+        DataType::UInt64 => downcast_value!(UInt64Array),
+        DataType::Float32 => downcast_value!(Float32Array),
+        DataType::Float64 => downcast_value!(Float64Array),
+        _ => None,
+    }
+}
+
+fn text_ngram_statistics(
+    fs_file_path: &Path,
+    fields: &[String],
+    max_terms: usize,
+) -> anyhow::Result<HashMap<String, TextNgrams>> {
+    let file = std::fs::File::open(fs_file_path)?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+    let schema = builder.schema();
+    let projected_indices: Vec<_> = fields
+        .iter()
+        .filter_map(|field| schema.index_of(field).ok())
+        .collect();
+
+    if projected_indices.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let projection = ProjectionMask::roots(builder.parquet_schema(), projected_indices);
+    let mut reader = builder.with_projection(projection).build()?;
+    let mut grams_by_field: HashMap<String, BTreeSet<String>> = fields
+        .iter()
+        .map(|field| (field.clone(), BTreeSet::new()))
+        .collect();
+    let mut complete_by_field: HashMap<String, bool> =
+        fields.iter().map(|field| (field.clone(), true)).collect();
+    let mut seen_fields = HashSet::new();
+
+    for batch in &mut reader {
+        let batch = batch?;
+        let schema = batch.schema();
+        for (idx, field) in schema.fields().iter().enumerate() {
+            let name = field.name();
+            if !complete_by_field
+                .get(name.as_str())
+                .copied()
+                .unwrap_or(false)
+            {
+                continue;
+            }
+
+            seen_fields.insert(name.clone());
+            let Some(grams) = grams_by_field.get_mut(name.as_str()) else {
+                continue;
+            };
+
+            if !collect_text_ngrams(batch.column(idx).as_ref(), grams, max_terms) {
+                grams.clear();
+                complete_by_field.insert(name.clone(), false);
+            }
+        }
+    }
+
+    Ok(grams_by_field
+        .into_iter()
+        .filter_map(|(name, grams)| {
+            if seen_fields.contains(&name) && complete_by_field.get(&name).copied().unwrap_or(false)
+            {
+                Some((
+                    name,
+                    TextNgrams {
+                        complete: true,
+                        grams: grams.into_iter().collect(),
+                    },
+                ))
+            } else {
+                None
+            }
+        })
+        .collect())
+}
+
+fn collect_text_ngrams(array: &dyn Array, grams: &mut BTreeSet<String>, max_terms: usize) -> bool {
+    for idx in 0..array.len() {
+        if array.is_null(idx) {
+            continue;
+        }
+
+        let Some(value) = string_value_from_array(array, idx) else {
+            return false;
+        };
+        insert_lowercase_trigrams(value.as_ref(), grams);
+
+        if grams.len() > max_terms {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn string_value_from_array(array: &dyn Array, idx: usize) -> Option<String> {
+    match array.data_type() {
+        DataType::Utf8 => array
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .map(|array| array.value(idx).to_string()),
+        DataType::LargeUtf8 => array
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .map(|array| array.value(idx).to_string()),
+        DataType::Utf8View => array
+            .as_any()
+            .downcast_ref::<StringViewArray>()
+            .map(|array| array.value(idx).to_string()),
+        _ => None,
+    }
+}
+
+fn insert_lowercase_trigrams(value: &str, grams: &mut BTreeSet<String>) {
+    let chars = value.to_lowercase().chars().collect::<Vec<_>>();
+    if chars.len() < 3 {
+        return;
+    }
+
+    for window in chars.windows(3) {
+        grams.insert(window.iter().collect());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow_array::{RecordBatch, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+    use parquet::arrow::ArrowWriter;
+
+    use super::{exact_value_statistics, text_ngram_statistics};
+
+    #[test]
+    fn exact_value_statistics_reads_dotted_string_fields() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let parquet_path = temp_dir.path().join("events.parquet");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("attributes.trace.id.synthetic", DataType::Utf8, true),
+            Field::new("body", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["trace-b", "trace-a", "trace-b"])),
+                Arc::new(StringArray::from(vec!["one", "two", "three"])),
+            ],
+        )?;
+
+        let file = std::fs::File::create(&parquet_path)?;
+        let mut writer = ArrowWriter::try_new(file, schema, None)?;
+        writer.write(&batch)?;
+        writer.close()?;
+
+        let indexes = exact_value_statistics(
+            &parquet_path,
+            &["attributes.trace.id.synthetic".to_string()],
+            8,
+        )?;
+        let exact_values = indexes
+            .get("attributes.trace.id.synthetic")
+            .expect("dotted field index");
+
+        assert!(exact_values.complete);
+        assert_eq!(exact_values.values, vec!["trace-a", "trace-b"]);
+
+        let truncated = exact_value_statistics(
+            &parquet_path,
+            &["attributes.trace.id.synthetic".to_string()],
+            1,
+        )?;
+        assert!(!truncated.contains_key("attributes.trace.id.synthetic"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn text_ngram_statistics_reads_body_substrings() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let parquet_path = temp_dir.path().join("events.parquet");
+        let schema = Arc::new(Schema::new(vec![Field::new("body", DataType::Utf8, true)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(vec![
+                "upstream_timeout while loading cart_id",
+                "ValueError from large_payload",
+            ]))],
+        )?;
+
+        let file = std::fs::File::create(&parquet_path)?;
+        let mut writer = ArrowWriter::try_new(file, schema, None)?;
+        writer.write(&batch)?;
+        writer.close()?;
+
+        let indexes = text_ngram_statistics(&parquet_path, &["body".to_string()], 1024)?;
+        let ngrams = indexes.get("body").expect("body ngram index");
+
+        assert!(ngrams.complete);
+        assert!(ngrams.grams.contains(&"ups".to_string()));
+        assert!(ngrams.grams.contains(&"tim".to_string()));
+        assert!(ngrams.grams.contains(&"val".to_string()));
+
+        let truncated = text_ngram_statistics(&parquet_path, &["body".to_string()], 1)?;
+        assert!(!truncated.contains_key("body"));
+
+        Ok(())
+    }
 }

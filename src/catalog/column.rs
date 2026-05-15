@@ -58,6 +58,34 @@ pub enum TypedStatistics {
     String(Utf8Type),
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ExactValues {
+    pub complete: bool,
+    pub values: Vec<String>,
+}
+
+impl ExactValues {
+    pub fn contains(&self, value: &str) -> bool {
+        self.values
+            .binary_search_by(|existing| existing.as_str().cmp(value))
+            .is_ok()
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TextNgrams {
+    pub complete: bool,
+    pub grams: Vec<String>,
+}
+
+impl TextNgrams {
+    pub fn contains(&self, gram: &str) -> bool {
+        self.grams
+            .binary_search_by(|existing| existing.as_str().cmp(gram))
+            .is_ok()
+    }
+}
+
 impl TypedStatistics {
     /// Variant name used in logs when the two operands disagree on type.
     fn variant_name(&self) -> &'static str {
@@ -201,6 +229,10 @@ fn is_valid_float_range(min: f64, max: f64) -> bool {
 pub struct Column {
     pub name: String,
     pub stats: Option<TypedStatistics>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exact_values: Option<ExactValues>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_ngrams: Option<TextNgrams>,
     pub uncompressed_size: u64,
     pub compressed_size: u64,
 }
