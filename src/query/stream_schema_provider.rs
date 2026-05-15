@@ -967,8 +967,12 @@ pub trait ManifestExt: ManifestFile {
             && let Some(text_ngrams) = &col.text_ngrams
             && text_ngrams.complete
         {
-            let grams = like_literal_trigrams(pattern, escape_char);
-            if !grams.is_empty() && grams.iter().any(|gram| !text_ngrams.contains(gram)) {
+            let grams = like_literal_index_terms(pattern, escape_char);
+            if grams
+                .iter()
+                .filter(|gram| gram.chars().count() >= text_ngrams.min_len)
+                .any(|gram| !text_ngrams.contains(gram))
+            {
                 return true;
             }
         }
@@ -1043,7 +1047,7 @@ fn extract_like_pattern(expr: &Expr) -> Option<(&str, &str, Option<char>)> {
     Some((&col.name, pattern, like.escape_char))
 }
 
-fn like_literal_trigrams(pattern: &str, escape_char: Option<char>) -> Vec<String> {
+fn like_literal_index_terms(pattern: &str, escape_char: Option<char>) -> Vec<String> {
     let mut grams = Vec::new();
     let mut literal = String::new();
     let mut escaped = false;
@@ -1055,7 +1059,7 @@ fn like_literal_trigrams(pattern: &str, escape_char: Option<char>) -> Vec<String
         }
 
         if !escaped && matches!(ch, '%' | '_') {
-            push_literal_trigrams(&literal, &mut grams);
+            push_literal_index_terms(&literal, &mut grams);
             literal.clear();
             continue;
         }
@@ -1063,19 +1067,20 @@ fn like_literal_trigrams(pattern: &str, escape_char: Option<char>) -> Vec<String
         literal.push(ch);
         escaped = false;
     }
-    push_literal_trigrams(&literal, &mut grams);
+    push_literal_index_terms(&literal, &mut grams);
     grams.sort();
     grams.dedup();
     grams
 }
 
-fn push_literal_trigrams(literal: &str, grams: &mut Vec<String>) {
+fn push_literal_index_terms(literal: &str, grams: &mut Vec<String>) {
     let chars = literal.to_lowercase().chars().collect::<Vec<_>>();
-    if chars.len() < 3 {
+    if chars.is_empty() {
         return;
     }
 
-    grams.extend(chars.windows(3).map(|window| window.iter().collect()));
+    let width = chars.len().min(3);
+    grams.extend(chars.windows(width).map(|window| window.iter().collect()));
 }
 
 #[derive(Clone, Copy)]
@@ -1166,7 +1171,7 @@ mod tests {
 
     use super::{
         ManifestExt, PartialTimeFilter, extract_timestamp_bound, is_overlapping_query,
-        like_literal_trigrams, parquet_scan_batch_size,
+        like_literal_index_terms, parquet_scan_batch_size,
     };
 
     fn datetime_min(year: i32, month: u32, day: u32) -> DateTime<Utc> {
@@ -1265,6 +1270,10 @@ mod tests {
     }
 
     fn text_ngram_file(grams: &[&str], complete: bool) -> File {
+        text_ngram_file_with_min_len(grams, complete, 1)
+    }
+
+    fn text_ngram_file_with_min_len(grams: &[&str], complete: bool, min_len: usize) -> File {
         let mut grams = grams
             .iter()
             .map(|value| value.to_string())
@@ -1280,7 +1289,11 @@ mod tests {
                 name: "body".to_string(),
                 stats: None,
                 exact_values: None,
-                text_ngrams: Some(TextNgrams { complete, grams }),
+                text_ngrams: Some(TextNgrams {
+                    complete,
+                    min_len,
+                    grams,
+                }),
                 uncompressed_size: 10,
                 compressed_size: 10,
             }],
@@ -1348,10 +1361,28 @@ mod tests {
     }
 
     #[test]
-    fn like_literal_trigrams_respects_wildcards_and_escapes() {
-        assert_eq!(like_literal_trigrams("%cart_id%", None)[0], "art");
-        assert!(like_literal_trigrams("%ab%", None).is_empty());
-        assert!(like_literal_trigrams(r"%abc\_def%", Some('\\')).contains(&"c_d".to_string()));
+    fn text_ngram_index_prunes_short_like_when_required_bigram_missing() {
+        let file = text_ngram_file(&["q", "x", "x=", "=1"], true);
+
+        assert!(file.can_be_pruned(&like_filter("%q1%")));
+        assert!(!file.can_be_pruned(&like_filter("%x=%")));
+    }
+
+    #[test]
+    fn legacy_trigram_index_does_not_prune_short_like() {
+        let file = text_ngram_file_with_min_len(&["ups"], true, 3);
+
+        assert!(!file.can_be_pruned(&like_filter("%q1%")));
+    }
+
+    #[test]
+    fn like_literal_index_terms_respects_wildcards_and_escapes() {
+        assert_eq!(like_literal_index_terms("%cart_id%", None)[0], "art");
+        assert_eq!(
+            like_literal_index_terms("%ab%", None),
+            vec!["ab".to_string()]
+        );
+        assert!(like_literal_index_terms(r"%abc\_def%", Some('\\')).contains(&"c_d".to_string()));
     }
 
     #[test]

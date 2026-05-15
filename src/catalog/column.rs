@@ -75,6 +75,8 @@ impl ExactValues {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TextNgrams {
     pub complete: bool,
+    #[serde(default = "default_text_ngram_min_len")]
+    pub min_len: usize,
     pub grams: Vec<String>,
 }
 
@@ -84,6 +86,10 @@ impl TextNgrams {
             .binary_search_by(|existing| existing.as_str().cmp(gram))
             .is_ok()
     }
+}
+
+fn default_text_ngram_min_len() -> usize {
+    3
 }
 
 impl TypedStatistics {

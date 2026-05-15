@@ -495,6 +495,7 @@ fn text_ngram_statistics(
                     name,
                     TextNgrams {
                         complete: true,
+                        min_len: 1,
                         grams: grams.into_iter().collect(),
                     },
                 ))
@@ -514,7 +515,7 @@ fn collect_text_ngrams(array: &dyn Array, grams: &mut BTreeSet<String>, max_term
         let Some(value) = string_value_from_array(array, idx) else {
             return false;
         };
-        insert_lowercase_trigrams(value.as_ref(), grams);
+        insert_lowercase_pruning_ngrams(value.as_ref(), grams);
 
         if grams.len() > max_terms {
             return false;
@@ -542,14 +543,12 @@ fn string_value_from_array(array: &dyn Array, idx: usize) -> Option<String> {
     }
 }
 
-fn insert_lowercase_trigrams(value: &str, grams: &mut BTreeSet<String>) {
+fn insert_lowercase_pruning_ngrams(value: &str, grams: &mut BTreeSet<String>) {
     let chars = value.to_lowercase().chars().collect::<Vec<_>>();
-    if chars.len() < 3 {
-        return;
-    }
-
-    for window in chars.windows(3) {
-        grams.insert(window.iter().collect());
+    for width in 1..=chars.len().min(3) {
+        for window in chars.windows(width) {
+            grams.insert(window.iter().collect());
+        }
     }
 }
 
@@ -629,8 +628,12 @@ mod tests {
 
         assert!(ngrams.complete);
         assert!(ngrams.grams.contains(&"ups".to_string()));
+        assert!(ngrams.grams.contains(&"u".to_string()));
+        assert!(ngrams.grams.contains(&"up".to_string()));
+        assert!(ngrams.grams.contains(&"lo".to_string()));
         assert!(ngrams.grams.contains(&"tim".to_string()));
         assert!(ngrams.grams.contains(&"val".to_string()));
+        assert_eq!(ngrams.min_len, 1);
 
         let truncated = text_ngram_statistics(&parquet_path, &["body".to_string()], 1)?;
         assert!(!truncated.contains_key("body"));
