@@ -941,12 +941,7 @@ pub fn extract_primary_filter(
 pub trait ManifestExt: ManifestFile {
     fn find_matching_column(&self, partial_filter: &Expr) -> Option<&Column> {
         let name = match partial_filter {
-            Expr::BinaryExpr(binary_expr) => {
-                let Expr::Column(col) = binary_expr.left.as_ref() else {
-                    return None;
-                };
-                &col.name
-            }
+            Expr::BinaryExpr(binary_expr) => filter_column_name(binary_expr.left.as_ref())?,
             _ => {
                 return None;
             }
@@ -1007,6 +1002,15 @@ pub trait ManifestExt: ManifestFile {
 }
 
 impl<T: ManifestFile> ManifestExt for T {}
+
+fn filter_column_name(expr: &Expr) -> Option<&str> {
+    match expr {
+        Expr::Column(col) => Some(&col.name),
+        Expr::Cast(cast) => filter_column_name(cast.expr.as_ref()),
+        Expr::TryCast(cast) => filter_column_name(cast.expr.as_ref()),
+        _ => None,
+    }
+}
 
 fn parquet_scan_batch_size(configured: usize, limit: Option<usize>) -> usize {
     let configured = configured.max(1);
@@ -1146,6 +1150,7 @@ fn satisfy_constraints(value: CastRes, op: Operator, stats: &TypedStatistics) ->
 mod tests {
     use std::ops::Add;
 
+    use arrow_schema::DataType;
     use chrono::{DateTime, Duration, NaiveDate, NaiveDateTime, NaiveTime, Utc};
     use datafusion::{
         logical_expr::{BinaryExpr, Operator},
@@ -1154,7 +1159,7 @@ mod tests {
     };
 
     use crate::catalog::{
-        column::{Column, ExactValues, TextNgrams, TypedStatistics, Utf8Type},
+        column::{Column, ExactValues, Int64Type, TextNgrams, TypedStatistics, Utf8Type},
         manifest::File,
         snapshot::ManifestItem,
     };
@@ -1283,6 +1288,35 @@ mod tests {
         }
     }
 
+    fn numeric_stats_file(min: i64, max: i64) -> File {
+        File {
+            file_path: "file.parquet".to_string(),
+            num_rows: 10,
+            file_size: 10,
+            ingestion_size: 10,
+            columns: vec![Column {
+                name: "duration_ms".to_string(),
+                stats: Some(TypedStatistics::Int(Int64Type { min, max })),
+                exact_values: None,
+                text_ngrams: None,
+                uncompressed_size: 10,
+                compressed_size: 10,
+            }],
+            sort_order_id: Vec::new(),
+        }
+    }
+
+    fn cast_numeric_filter(value: i64, op: Operator) -> Expr {
+        Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(Expr::Cast(datafusion::logical_expr::Cast::new(
+                Box::new(Expr::Column("duration_ms".into())),
+                DataType::Int64,
+            ))),
+            op,
+            Box::new(Expr::Literal(ScalarValue::Int64(Some(value)), None)),
+        ))
+    }
+
     #[test]
     fn exact_index_prunes_missing_equality_inside_min_max_range() {
         let file = exact_index_file(&["a", "z"], true);
@@ -1327,6 +1361,14 @@ mod tests {
         assert_eq!(parquet_scan_batch_size(512, Some(100)), 512);
         assert_eq!(parquet_scan_batch_size(20_000, None), 20_000);
         assert_eq!(parquet_scan_batch_size(0, Some(100)), 1);
+    }
+
+    #[test]
+    fn manifest_pruning_sees_column_through_cast() {
+        let file = numeric_stats_file(100, 400);
+
+        assert!(file.can_be_pruned(&cast_numeric_filter(1500, Operator::GtEq)));
+        assert!(!file.can_be_pruned(&cast_numeric_filter(300, Operator::GtEq)));
     }
 
     #[test]
