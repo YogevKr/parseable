@@ -1609,6 +1609,11 @@ mod tests {
             vec!["ab".to_string()]
         );
         assert!(like_literal_index_terms(r"%abc\_def%", Some('\\')).contains(&"c_d".to_string()));
+        assert!(like_literal_index_terms("%/123", None).contains(&"123".to_string()));
+        assert!(like_literal_index_terms("%value with spaces%", None).contains(&" wi".to_string()));
+        assert!(
+            like_literal_index_terms("%cache_key=product:%", None).contains(&"y=p".to_string())
+        );
     }
 
     #[test]
