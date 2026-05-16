@@ -257,10 +257,12 @@ impl StandardTableProvider {
 
         // Staging arrow exection plan
         let records = staging.recordbatches_cloned(&self.schema);
-        let arrow_exec = reversed_mem_table(records, self.schema.clone())?
-            .scan(state, projection, filters, limit)
-            .await?;
-        execution_plans.push(arrow_exec);
+        if !records.is_empty() {
+            let arrow_exec = reversed_mem_table(records, self.schema.clone())?
+                .scan(state, projection, filters, limit)
+                .await?;
+            execution_plans.push(arrow_exec);
+        }
 
         // Get a list of parquet files still in staging, order by filename
         let mut parquet_files = staging.parquet_files();
@@ -275,6 +277,10 @@ impl StandardTableProvider {
             };
             let file = PartitionedFile::new(file_path.display().to_string(), file_meta.len());
             partitioned_files.push(file)
+        }
+
+        if partitioned_files.is_empty() {
+            return Ok(());
         }
 
         // // NOTE: There is the possibility of a parquet file being pushed to object store
