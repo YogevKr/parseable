@@ -964,14 +964,23 @@ pub trait ManifestExt: ManifestFile {
 
         if let Some((column_name, pattern, escape_char)) = extract_like_pattern(partial_filter)
             && let Some(col) = self.columns().iter().find(|col| col.name == column_name)
-            && let Some(text_ngrams) = &col.text_ngrams
-            && text_ngrams.complete
         {
             let grams = like_literal_index_terms(pattern, escape_char);
-            if grams
-                .iter()
-                .filter(|gram| gram.chars().count() >= text_ngrams.min_len)
-                .any(|gram| !text_ngrams.contains(gram))
+            if let Some(text_ngrams) = &col.text_ngrams
+                && text_ngrams.complete
+                && grams
+                    .iter()
+                    .filter(|gram| gram.chars().count() >= text_ngrams.min_len)
+                    .any(|gram| !text_ngrams.contains(gram))
+            {
+                return true;
+            }
+            if let Some(text_ngram_hashes) = &col.text_ngram_hashes
+                && text_ngram_hashes.complete
+                && grams
+                    .iter()
+                    .filter(|gram| gram.chars().count() >= text_ngram_hashes.min_len)
+                    .any(|gram| !text_ngram_hashes.contains(gram))
             {
                 return true;
             }
@@ -1255,8 +1264,8 @@ mod tests {
 
     use crate::catalog::{
         column::{
-            Column, ExactHashes, ExactValues, Int64Type, TextNgrams, TypedStatistics, Utf8Type,
-            exact_value_hash,
+            Column, ExactHashes, ExactValues, Int64Type, TextNgramHashes, TextNgrams,
+            TypedStatistics, Utf8Type, exact_value_hash, text_ngram_hash,
         },
         manifest::File,
         snapshot::ManifestItem,
@@ -1343,6 +1352,7 @@ mod tests {
                 exact_values: Some(ExactValues { complete, values }),
                 exact_hashes: None,
                 text_ngrams: None,
+                text_ngram_hashes: None,
                 uncompressed_size: 10,
                 compressed_size: 10,
             }],
@@ -1371,6 +1381,7 @@ mod tests {
                 exact_values: None,
                 exact_hashes: Some(ExactHashes { complete, hashes }),
                 text_ngrams: None,
+                text_ngram_hashes: None,
                 uncompressed_size: 10,
                 compressed_size: 10,
             }],
@@ -1417,6 +1428,37 @@ mod tests {
                     min_len,
                     grams,
                 }),
+                text_ngram_hashes: None,
+                uncompressed_size: 10,
+                compressed_size: 10,
+            }],
+            sort_order_id: Vec::new(),
+        }
+    }
+
+    fn text_ngram_hash_file(grams: &[&str], complete: bool) -> File {
+        let mut hashes = grams
+            .iter()
+            .map(|value| text_ngram_hash(value))
+            .collect::<Vec<_>>();
+        hashes.sort();
+
+        File {
+            file_path: "file.parquet".to_string(),
+            num_rows: 10,
+            file_size: 10,
+            ingestion_size: 10,
+            columns: vec![Column {
+                name: "body".to_string(),
+                stats: None,
+                exact_values: None,
+                exact_hashes: None,
+                text_ngrams: None,
+                text_ngram_hashes: Some(TextNgramHashes {
+                    complete,
+                    min_len: 1,
+                    hashes,
+                }),
                 uncompressed_size: 10,
                 compressed_size: 10,
             }],
@@ -1436,6 +1478,7 @@ mod tests {
                 exact_values: None,
                 exact_hashes: None,
                 text_ngrams: None,
+                text_ngram_hashes: None,
                 uncompressed_size: 10,
                 compressed_size: 10,
             }],
@@ -1464,6 +1507,7 @@ mod tests {
                 }),
                 exact_hashes: None,
                 text_ngrams: None,
+                text_ngram_hashes: None,
                 uncompressed_size: 10,
                 compressed_size: 10,
             }],
@@ -1523,6 +1567,21 @@ mod tests {
     #[test]
     fn incomplete_text_ngram_index_does_not_prune_like() {
         let file = text_ngram_file(&["ups"], false);
+
+        assert!(!file.can_be_pruned(&like_filter("%definitely_not_present_token%")));
+    }
+
+    #[test]
+    fn text_ngram_hash_index_prunes_like_when_required_term_missing() {
+        let file = text_ngram_hash_file(&["ups", "pst", "str", "tre", "rea", "eam"], true);
+
+        assert!(file.can_be_pruned(&like_filter("%definitely_not_present_token%")));
+        assert!(!file.can_be_pruned(&like_filter("%upstream%")));
+    }
+
+    #[test]
+    fn incomplete_text_ngram_hash_index_does_not_prune_like() {
+        let file = text_ngram_hash_file(&["ups"], false);
 
         assert!(!file.can_be_pruned(&like_filter("%definitely_not_present_token%")));
     }

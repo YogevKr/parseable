@@ -38,7 +38,10 @@ use parquet::{
 
 use crate::metastore::metastore_traits::MetastoreObject;
 
-use super::column::{Column, ExactHashes, ExactValues, TextNgrams, exact_value_hash};
+use super::column::{
+    Column, ExactHashes, ExactValues, TextNgramHashes, TextNgrams, exact_value_hash,
+    text_ngram_hash,
+};
 
 const EXACT_INDEX_FIELDS_ENV: &str = "P_EXACT_INDEX_FIELDS";
 const EXACT_INDEX_MAX_VALUES_ENV: &str = "P_EXACT_INDEX_MAX_VALUES";
@@ -48,6 +51,8 @@ const DEFAULT_EXACT_INDEX_MAX_HASHES: usize = 1_000_000;
 const TEXT_INDEX_FIELDS_ENV: &str = "P_TEXT_INDEX_FIELDS";
 const TEXT_INDEX_MAX_TERMS_ENV: &str = "P_TEXT_INDEX_MAX_TERMS";
 const DEFAULT_TEXT_INDEX_MAX_TERMS: usize = 65_536;
+const TEXT_INDEX_MAX_HASHES_ENV: &str = "P_TEXT_INDEX_MAX_HASHES";
+const DEFAULT_TEXT_INDEX_MAX_HASHES: usize = 1_000_000;
 
 struct ExactIndexConfig {
     fields: Vec<String>,
@@ -63,6 +68,12 @@ struct ExactIndexData {
 struct TextIndexConfig {
     fields: Vec<String>,
     max_terms: usize,
+    max_hashes: usize,
+}
+
+struct TextIndexData {
+    terms: Option<TextNgrams>,
+    hashes: Option<TextNgramHashes>,
 }
 
 #[derive(
@@ -186,11 +197,17 @@ pub fn create_from_parquet_file(
         }
     }
     if let Some(config) = text_index_config_from_env() {
-        match text_ngram_statistics(fs_file_path, &config.fields, config.max_terms) {
+        match text_ngram_statistics(
+            fs_file_path,
+            &config.fields,
+            config.max_terms,
+            config.max_hashes,
+        ) {
             Ok(text_indexes) => {
-                for (name, text_ngrams) in text_indexes {
+                for (name, text_index) in text_indexes {
                     if let Some(column) = columns.get_mut(&name) {
-                        column.text_ngrams = Some(text_ngrams);
+                        column.text_ngrams = text_index.terms;
+                        column.text_ngram_hashes = text_index.hashes;
                     }
                 }
             }
@@ -270,6 +287,7 @@ fn column_statistics(row_groups: &[RowGroupMetaData]) -> HashMap<String, Column>
                         exact_values: None,
                         exact_hashes: None,
                         text_ngrams: None,
+                        text_ngram_hashes: None,
                         uncompressed_size: col.uncompressed_size() as u64,
                         compressed_size: col.compressed_size() as u64,
                     },
@@ -332,7 +350,16 @@ fn text_index_config_from_env() -> Option<TextIndexConfig> {
         .and_then(|value| value.parse().ok())
         .unwrap_or(DEFAULT_TEXT_INDEX_MAX_TERMS);
 
-    (max_terms > 0).then_some(TextIndexConfig { fields, max_terms })
+    let max_hashes = std::env::var(TEXT_INDEX_MAX_HASHES_ENV)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(DEFAULT_TEXT_INDEX_MAX_HASHES);
+
+    (max_terms > 0 || max_hashes > 0).then_some(TextIndexConfig {
+        fields,
+        max_terms,
+        max_hashes,
+    })
 }
 
 fn exact_index_statistics(
@@ -530,7 +557,8 @@ fn text_ngram_statistics(
     fs_file_path: &Path,
     fields: &[String],
     max_terms: usize,
-) -> anyhow::Result<HashMap<String, TextNgrams>> {
+    max_hashes: usize,
+) -> anyhow::Result<HashMap<String, TextIndexData>> {
     let file = std::fs::File::open(fs_file_path)?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
     let schema = builder.schema();
@@ -545,12 +573,22 @@ fn text_ngram_statistics(
 
     let projection = ProjectionMask::roots(builder.parquet_schema(), projected_indices);
     let mut reader = builder.with_projection(projection).build()?;
-    let mut grams_by_field: HashMap<String, BTreeSet<String>> = fields
+    let mut terms_by_field: HashMap<String, BTreeSet<String>> = fields
         .iter()
         .map(|field| (field.clone(), BTreeSet::new()))
         .collect();
-    let mut complete_by_field: HashMap<String, bool> =
-        fields.iter().map(|field| (field.clone(), true)).collect();
+    let mut hashes_by_field: HashMap<String, BTreeSet<u64>> = fields
+        .iter()
+        .map(|field| (field.clone(), BTreeSet::new()))
+        .collect();
+    let mut terms_complete_by_field: HashMap<String, bool> = fields
+        .iter()
+        .map(|field| (field.clone(), max_terms > 0))
+        .collect();
+    let mut hashes_complete_by_field: HashMap<String, bool> = fields
+        .iter()
+        .map(|field| (field.clone(), max_hashes > 0))
+        .collect();
     let mut seen_fields = HashSet::new();
 
     for batch in &mut reader {
@@ -558,63 +596,125 @@ fn text_ngram_statistics(
         let schema = batch.schema();
         for (idx, field) in schema.fields().iter().enumerate() {
             let name = field.name();
-            if !complete_by_field
+            let terms_active = terms_complete_by_field
                 .get(name.as_str())
                 .copied()
-                .unwrap_or(false)
-            {
+                .unwrap_or(false);
+            let hashes_active = hashes_complete_by_field
+                .get(name.as_str())
+                .copied()
+                .unwrap_or(false);
+            if !terms_active && !hashes_active {
                 continue;
             }
 
             seen_fields.insert(name.clone());
-            let Some(grams) = grams_by_field.get_mut(name.as_str()) else {
+            let Some(terms) = terms_by_field.get_mut(name.as_str()) else {
+                continue;
+            };
+            let Some(hashes) = hashes_by_field.get_mut(name.as_str()) else {
                 continue;
             };
 
-            if !collect_text_ngrams(batch.column(idx).as_ref(), grams, max_terms) {
-                grams.clear();
-                complete_by_field.insert(name.clone(), false);
+            let (terms_complete, hashes_complete) = collect_text_ngram_indexes(
+                batch.column(idx).as_ref(),
+                terms,
+                terms_active,
+                max_terms,
+                hashes,
+                hashes_active,
+                max_hashes,
+            );
+            if !terms_complete {
+                terms.clear();
+                terms_complete_by_field.insert(name.clone(), false);
+            }
+            if !hashes_complete {
+                hashes.clear();
+                hashes_complete_by_field.insert(name.clone(), false);
             }
         }
     }
 
-    Ok(grams_by_field
+    Ok(terms_by_field
         .into_iter()
-        .filter_map(|(name, grams)| {
-            if seen_fields.contains(&name) && complete_by_field.get(&name).copied().unwrap_or(false)
-            {
-                Some((
-                    name,
-                    TextNgrams {
+        .filter_map(|(name, terms)| {
+            if !seen_fields.contains(&name) {
+                None
+            } else {
+                let terms = terms_complete_by_field
+                    .get(&name)
+                    .copied()
+                    .unwrap_or(false)
+                    .then(|| TextNgrams {
                         complete: true,
                         min_len: 1,
-                        grams: grams.into_iter().collect(),
-                    },
-                ))
-            } else {
-                None
+                        grams: terms.into_iter().collect(),
+                    });
+                let hashes = hashes_complete_by_field
+                    .get(&name)
+                    .copied()
+                    .unwrap_or(false)
+                    .then(|| TextNgramHashes {
+                        complete: true,
+                        min_len: 1,
+                        hashes: hashes_by_field
+                            .remove(&name)
+                            .unwrap_or_default()
+                            .into_iter()
+                            .collect(),
+                    });
+
+                (terms.is_some() || hashes.is_some())
+                    .then_some((name, TextIndexData { terms, hashes }))
             }
         })
         .collect())
 }
 
-fn collect_text_ngrams(array: &dyn Array, grams: &mut BTreeSet<String>, max_terms: usize) -> bool {
+fn collect_text_ngram_indexes(
+    array: &dyn Array,
+    terms: &mut BTreeSet<String>,
+    terms_active: bool,
+    max_terms: usize,
+    hashes: &mut BTreeSet<u64>,
+    hashes_active: bool,
+    max_hashes: usize,
+) -> (bool, bool) {
+    let mut terms_complete = terms_active;
+    let mut hashes_complete = hashes_active;
+
     for idx in 0..array.len() {
         if array.is_null(idx) {
             continue;
         }
 
         let Some(value) = string_value_from_array(array, idx) else {
-            return false;
+            return (false, false);
         };
-        insert_lowercase_pruning_ngrams(value.as_ref(), grams);
+        insert_lowercase_pruning_ngram_indexes(
+            value.as_ref(),
+            terms,
+            terms_complete,
+            hashes,
+            hashes_complete,
+        );
 
-        if grams.len() > max_terms {
-            return false;
+        if terms_complete && terms.len() > max_terms {
+            terms.clear();
+            terms_complete = false;
+        }
+        if hashes_complete && hashes.len() > max_hashes {
+            hashes.clear();
+            hashes_complete = false;
+        }
+
+        if !terms_complete && !hashes_complete {
+            break;
         }
     }
 
-    true
+    (terms_complete, hashes_complete)
 }
 
 fn string_value_from_array(array: &dyn Array, idx: usize) -> Option<String> {
@@ -635,11 +735,23 @@ fn string_value_from_array(array: &dyn Array, idx: usize) -> Option<String> {
     }
 }
 
-fn insert_lowercase_pruning_ngrams(value: &str, grams: &mut BTreeSet<String>) {
+fn insert_lowercase_pruning_ngram_indexes(
+    value: &str,
+    terms: &mut BTreeSet<String>,
+    terms_active: bool,
+    hashes: &mut BTreeSet<u64>,
+    hashes_active: bool,
+) {
     let chars = value.to_lowercase().chars().collect::<Vec<_>>();
     for width in 1..=chars.len().min(3) {
         for window in chars.windows(width) {
-            grams.insert(window.iter().collect());
+            let gram: String = window.iter().collect();
+            if terms_active {
+                terms.insert(gram.clone());
+            }
+            if hashes_active {
+                hashes.insert(text_ngram_hash(&gram));
+            }
         }
     }
 }
@@ -729,8 +841,10 @@ mod tests {
         writer.write(&batch)?;
         writer.close()?;
 
-        let indexes = text_ngram_statistics(&parquet_path, &["body".to_string()], 1024)?;
-        let ngrams = indexes.get("body").expect("body ngram index");
+        let indexes = text_ngram_statistics(&parquet_path, &["body".to_string()], 1024, 1024)?;
+        let index = indexes.get("body").expect("body ngram index");
+        let ngrams = index.terms.as_ref().expect("body ngram terms");
+        let ngram_hashes = index.hashes.as_ref().expect("body ngram hashes");
 
         assert!(ngrams.complete);
         assert!(ngrams.grams.contains(&"ups".to_string()));
@@ -740,9 +854,16 @@ mod tests {
         assert!(ngrams.grams.contains(&"tim".to_string()));
         assert!(ngrams.grams.contains(&"val".to_string()));
         assert_eq!(ngrams.min_len, 1);
+        assert!(ngram_hashes.complete);
+        assert_eq!(ngram_hashes.min_len, 1);
+        assert!(ngram_hashes.contains("ups"));
 
-        let truncated = text_ngram_statistics(&parquet_path, &["body".to_string()], 1)?;
-        assert!(!truncated.contains_key("body"));
+        let truncated = text_ngram_statistics(&parquet_path, &["body".to_string()], 1, 1024)?;
+        let truncated = truncated
+            .get("body")
+            .expect("hash fallback remains after text term truncation");
+        assert!(truncated.terms.is_none());
+        assert!(truncated.hashes.is_some());
 
         Ok(())
     }
