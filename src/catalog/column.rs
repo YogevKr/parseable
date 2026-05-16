@@ -73,6 +73,23 @@ impl ExactValues {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ExactHashes {
+    pub complete: bool,
+    pub hashes: Vec<u64>,
+}
+
+impl ExactHashes {
+    pub fn contains_value(&self, value: &str) -> bool {
+        let hash = exact_value_hash(value);
+        self.hashes.binary_search(&hash).is_ok()
+    }
+}
+
+pub fn exact_value_hash(value: &str) -> u64 {
+    xxhash_rust::xxh3::xxh3_64(value.as_bytes())
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TextNgrams {
     pub complete: bool,
     #[serde(default = "default_text_ngram_min_len")]
@@ -237,6 +254,8 @@ pub struct Column {
     pub stats: Option<TypedStatistics>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exact_values: Option<ExactValues>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exact_hashes: Option<ExactHashes>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text_ngrams: Option<TextNgrams>,
     pub uncompressed_size: u64,

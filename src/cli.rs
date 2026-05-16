@@ -513,6 +513,14 @@ pub struct Options {
 
     #[arg(
         long,
+        env = "P_EXACT_INDEX_MAX_HASHES",
+        default_value = "1000000",
+        help = "Maximum distinct hashed values per file and field for exact-equality manifest indexes"
+    )]
+    pub exact_index_max_hashes: usize,
+
+    #[arg(
+        long,
         env = "P_TEXT_INDEX_FIELDS",
         value_delimiter = ',',
         help = "Comma-separated text field names to store bounded trigram manifest indexes for LIKE pruning"

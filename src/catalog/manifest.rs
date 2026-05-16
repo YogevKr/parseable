@@ -38,11 +38,13 @@ use parquet::{
 
 use crate::metastore::metastore_traits::MetastoreObject;
 
-use super::column::{Column, ExactValues, TextNgrams};
+use super::column::{Column, ExactHashes, ExactValues, TextNgrams, exact_value_hash};
 
 const EXACT_INDEX_FIELDS_ENV: &str = "P_EXACT_INDEX_FIELDS";
 const EXACT_INDEX_MAX_VALUES_ENV: &str = "P_EXACT_INDEX_MAX_VALUES";
 const DEFAULT_EXACT_INDEX_MAX_VALUES: usize = 4096;
+const EXACT_INDEX_MAX_HASHES_ENV: &str = "P_EXACT_INDEX_MAX_HASHES";
+const DEFAULT_EXACT_INDEX_MAX_HASHES: usize = 1_000_000;
 const TEXT_INDEX_FIELDS_ENV: &str = "P_TEXT_INDEX_FIELDS";
 const TEXT_INDEX_MAX_TERMS_ENV: &str = "P_TEXT_INDEX_MAX_TERMS";
 const DEFAULT_TEXT_INDEX_MAX_TERMS: usize = 65_536;
@@ -50,6 +52,12 @@ const DEFAULT_TEXT_INDEX_MAX_TERMS: usize = 65_536;
 struct ExactIndexConfig {
     fields: Vec<String>,
     max_values: usize,
+    max_hashes: usize,
+}
+
+struct ExactIndexData {
+    values: Option<ExactValues>,
+    hashes: Option<ExactHashes>,
 }
 
 struct TextIndexConfig {
@@ -155,17 +163,23 @@ pub fn create_from_parquet_file(
 
     let mut columns = column_statistics(row_groups);
     if let Some(config) = exact_index_config_from_env() {
-        match exact_value_statistics(fs_file_path, &config.fields, config.max_values) {
+        match exact_index_statistics(
+            fs_file_path,
+            &config.fields,
+            config.max_values,
+            config.max_hashes,
+        ) {
             Ok(exact_indexes) => {
-                for (name, exact_values) in exact_indexes {
+                for (name, exact_index) in exact_indexes {
                     if let Some(column) = columns.get_mut(&name) {
-                        column.exact_values = Some(exact_values);
+                        column.exact_values = exact_index.values;
+                        column.exact_hashes = exact_index.hashes;
                     }
                 }
             }
             Err(err) => {
                 tracing::warn!(
-                    "failed to collect exact-value manifest indexes for {:?}: {err}",
+                    "failed to collect exact manifest indexes for {:?}: {err}",
                     fs_file_path
                 );
             }
@@ -254,6 +268,7 @@ fn column_statistics(row_groups: &[RowGroupMetaData]) -> HashMap<String, Column>
                         name: col_name,
                         stats: col.statistics().and_then(|stats| stats.try_into().ok()),
                         exact_values: None,
+                        exact_hashes: None,
                         text_ngrams: None,
                         uncompressed_size: col.uncompressed_size() as u64,
                         compressed_size: col.compressed_size() as u64,
@@ -285,7 +300,16 @@ fn exact_index_config_from_env() -> Option<ExactIndexConfig> {
         .and_then(|value| value.parse().ok())
         .unwrap_or(DEFAULT_EXACT_INDEX_MAX_VALUES);
 
-    (max_values > 0).then_some(ExactIndexConfig { fields, max_values })
+    let max_hashes = std::env::var(EXACT_INDEX_MAX_HASHES_ENV)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(DEFAULT_EXACT_INDEX_MAX_HASHES);
+
+    (max_values > 0 || max_hashes > 0).then_some(ExactIndexConfig {
+        fields,
+        max_values,
+        max_hashes,
+    })
 }
 
 fn text_index_config_from_env() -> Option<TextIndexConfig> {
@@ -311,11 +335,12 @@ fn text_index_config_from_env() -> Option<TextIndexConfig> {
     (max_terms > 0).then_some(TextIndexConfig { fields, max_terms })
 }
 
-fn exact_value_statistics(
+fn exact_index_statistics(
     fs_file_path: &Path,
     fields: &[String],
     max_values: usize,
-) -> anyhow::Result<HashMap<String, ExactValues>> {
+    max_hashes: usize,
+) -> anyhow::Result<HashMap<String, ExactIndexData>> {
     let file = std::fs::File::open(fs_file_path)?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
     let schema = builder.schema();
@@ -334,8 +359,18 @@ fn exact_value_statistics(
         .iter()
         .map(|field| (field.clone(), BTreeSet::new()))
         .collect();
-    let mut complete_by_field: HashMap<String, bool> =
-        fields.iter().map(|field| (field.clone(), true)).collect();
+    let mut hashes_by_field: HashMap<String, BTreeSet<u64>> = fields
+        .iter()
+        .map(|field| (field.clone(), BTreeSet::new()))
+        .collect();
+    let mut values_complete_by_field: HashMap<String, bool> = fields
+        .iter()
+        .map(|field| (field.clone(), max_values > 0))
+        .collect();
+    let mut hashes_complete_by_field: HashMap<String, bool> = fields
+        .iter()
+        .map(|field| (field.clone(), max_hashes > 0))
+        .collect();
     let mut seen_fields = HashSet::new();
 
     for batch in &mut reader {
@@ -343,11 +378,15 @@ fn exact_value_statistics(
         let schema = batch.schema();
         for (idx, field) in schema.fields().iter().enumerate() {
             let name = field.name();
-            if !complete_by_field
+            let values_active = values_complete_by_field
                 .get(name.as_str())
                 .copied()
-                .unwrap_or(false)
-            {
+                .unwrap_or(false);
+            let hashes_active = hashes_complete_by_field
+                .get(name.as_str())
+                .copied()
+                .unwrap_or(false);
+            if !values_active && !hashes_active {
                 continue;
             }
 
@@ -355,10 +394,26 @@ fn exact_value_statistics(
             let Some(values) = values_by_field.get_mut(name.as_str()) else {
                 continue;
             };
+            let Some(hashes) = hashes_by_field.get_mut(name.as_str()) else {
+                continue;
+            };
 
-            if !collect_exact_values(batch.column(idx).as_ref(), values, max_values) {
+            let (values_complete, hashes_complete) = collect_exact_indexes(
+                batch.column(idx).as_ref(),
+                values,
+                values_active,
+                max_values,
+                hashes,
+                hashes_active,
+                max_hashes,
+            );
+            if !values_complete {
                 values.clear();
-                complete_by_field.insert(name.clone(), false);
+                values_complete_by_field.insert(name.clone(), false);
+            }
+            if !hashes_complete {
+                hashes.clear();
+                hashes_complete_by_field.insert(name.clone(), false);
             }
         }
     }
@@ -366,43 +421,80 @@ fn exact_value_statistics(
     Ok(values_by_field
         .into_iter()
         .filter_map(|(name, values)| {
-            if seen_fields.contains(&name) && complete_by_field.get(&name).copied().unwrap_or(false)
-            {
-                Some((
-                    name,
-                    ExactValues {
-                        complete: true,
-                        values: values.into_iter().collect(),
-                    },
-                ))
-            } else {
-                None
+            if !seen_fields.contains(&name) {
+                return None;
             }
+
+            let values = values_complete_by_field
+                .get(&name)
+                .copied()
+                .unwrap_or(false)
+                .then(|| ExactValues {
+                    complete: true,
+                    values: values.into_iter().collect(),
+                });
+            let hashes = hashes_complete_by_field
+                .get(&name)
+                .copied()
+                .unwrap_or(false)
+                .then(|| ExactHashes {
+                    complete: true,
+                    hashes: hashes_by_field
+                        .remove(&name)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .collect(),
+                });
+
+            (values.is_some() || hashes.is_some())
+                .then_some((name, ExactIndexData { values, hashes }))
         })
         .collect())
 }
 
-fn collect_exact_values(
+fn collect_exact_indexes(
     array: &dyn Array,
     values: &mut BTreeSet<String>,
+    values_active: bool,
     max_values: usize,
-) -> bool {
+    hashes: &mut BTreeSet<u64>,
+    hashes_active: bool,
+    max_hashes: usize,
+) -> (bool, bool) {
+    let mut values_complete = values_active;
+    let mut hashes_complete = hashes_active;
+
     for idx in 0..array.len() {
         if array.is_null(idx) {
             continue;
         }
 
         let Some(value) = exact_value_from_array(array, idx) else {
-            return false;
+            return (false, false);
         };
-        values.insert(value);
+        if values_complete {
+            values.insert(value.clone());
 
-        if values.len() > max_values {
-            return false;
+            if values.len() > max_values {
+                values.clear();
+                values_complete = false;
+            }
+        }
+        if hashes_complete {
+            hashes.insert(exact_value_hash(&value));
+
+            if hashes.len() > max_hashes {
+                hashes.clear();
+                hashes_complete = false;
+            }
+        }
+
+        if !values_complete && !hashes_complete {
+            break;
         }
     }
 
-    true
+    (values_complete, hashes_complete)
 }
 
 fn exact_value_from_array(array: &dyn Array, idx: usize) -> Option<String> {
@@ -560,7 +652,7 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
     use parquet::arrow::ArrowWriter;
 
-    use super::{exact_value_statistics, text_ngram_statistics};
+    use super::{exact_index_statistics, text_ngram_statistics};
 
     #[test]
     fn exact_value_statistics_reads_dotted_string_fields() -> anyhow::Result<()> {
@@ -583,24 +675,38 @@ mod tests {
         writer.write(&batch)?;
         writer.close()?;
 
-        let indexes = exact_value_statistics(
+        let indexes = exact_index_statistics(
             &parquet_path,
             &["attributes.trace.id.synthetic".to_string()],
+            8,
             8,
         )?;
         let exact_values = indexes
             .get("attributes.trace.id.synthetic")
-            .expect("dotted field index");
+            .and_then(|index| index.values.as_ref())
+            .expect("dotted field value index");
+        let exact_hashes = indexes
+            .get("attributes.trace.id.synthetic")
+            .and_then(|index| index.hashes.as_ref())
+            .expect("dotted field hash index");
 
         assert!(exact_values.complete);
         assert_eq!(exact_values.values, vec!["trace-a", "trace-b"]);
+        assert!(exact_hashes.complete);
+        assert_eq!(exact_hashes.hashes.len(), 2);
+        assert!(exact_hashes.contains_value("trace-a"));
 
-        let truncated = exact_value_statistics(
+        let truncated = exact_index_statistics(
             &parquet_path,
             &["attributes.trace.id.synthetic".to_string()],
             1,
+            8,
         )?;
-        assert!(!truncated.contains_key("attributes.trace.id.synthetic"));
+        let truncated = truncated
+            .get("attributes.trace.id.synthetic")
+            .expect("hash fallback remains after value truncation");
+        assert!(truncated.values.is_none());
+        assert!(truncated.hashes.is_some());
 
         Ok(())
     }

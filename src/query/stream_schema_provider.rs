@@ -1005,6 +1005,13 @@ pub trait ManifestExt: ManifestFile {
                 return true;
             }
         }
+        if let Some(exact_hashes) = &col.exact_hashes
+            && exact_hashes.complete
+            && matches!(op, Operator::Eq | Operator::IsNotDistinctFrom)
+            && !exact_hashes.contains_value(&value.exact_index_key())
+        {
+            return true;
+        }
 
         let Some(stats) = &col.stats else {
             return false;
@@ -1247,7 +1254,10 @@ mod tests {
     };
 
     use crate::catalog::{
-        column::{Column, ExactValues, Int64Type, TextNgrams, TypedStatistics, Utf8Type},
+        column::{
+            Column, ExactHashes, ExactValues, Int64Type, TextNgrams, TypedStatistics, Utf8Type,
+            exact_value_hash,
+        },
         manifest::File,
         snapshot::ManifestItem,
     };
@@ -1331,6 +1341,35 @@ mod tests {
                     max: "z".to_string(),
                 })),
                 exact_values: Some(ExactValues { complete, values }),
+                exact_hashes: None,
+                text_ngrams: None,
+                uncompressed_size: 10,
+                compressed_size: 10,
+            }],
+            sort_order_id: Vec::new(),
+        }
+    }
+
+    fn exact_hash_index_file(values: &[&str], complete: bool) -> File {
+        let mut hashes = values
+            .iter()
+            .map(|value| exact_value_hash(value))
+            .collect::<Vec<_>>();
+        hashes.sort();
+
+        File {
+            file_path: "file.parquet".to_string(),
+            num_rows: 10,
+            file_size: 10,
+            ingestion_size: 10,
+            columns: vec![Column {
+                name: "trace_id".to_string(),
+                stats: Some(TypedStatistics::String(Utf8Type {
+                    min: "a".to_string(),
+                    max: "z".to_string(),
+                })),
+                exact_values: None,
+                exact_hashes: Some(ExactHashes { complete, hashes }),
                 text_ngrams: None,
                 uncompressed_size: 10,
                 compressed_size: 10,
@@ -1372,6 +1411,7 @@ mod tests {
                 name: "body".to_string(),
                 stats: None,
                 exact_values: None,
+                exact_hashes: None,
                 text_ngrams: Some(TextNgrams {
                     complete,
                     min_len,
@@ -1394,6 +1434,7 @@ mod tests {
                 name: "duration_ms".to_string(),
                 stats: Some(TypedStatistics::Int(Int64Type { min, max })),
                 exact_values: None,
+                exact_hashes: None,
                 text_ngrams: None,
                 uncompressed_size: 10,
                 compressed_size: 10,
@@ -1421,6 +1462,7 @@ mod tests {
                     complete: true,
                     values,
                 }),
+                exact_hashes: None,
                 text_ngrams: None,
                 uncompressed_size: 10,
                 compressed_size: 10,
@@ -1451,6 +1493,21 @@ mod tests {
     #[test]
     fn incomplete_exact_index_does_not_prune() {
         let file = exact_index_file(&["a", "z"], false);
+
+        assert!(!file.can_be_pruned(&exact_index_filter("m")));
+    }
+
+    #[test]
+    fn exact_hash_index_prunes_missing_equality_inside_min_max_range() {
+        let file = exact_hash_index_file(&["a", "z"], true);
+
+        assert!(file.can_be_pruned(&exact_index_filter("m")));
+        assert!(!file.can_be_pruned(&exact_index_filter("a")));
+    }
+
+    #[test]
+    fn incomplete_exact_hash_index_does_not_prune() {
+        let file = exact_hash_index_file(&["a", "z"], false);
 
         assert!(!file.can_be_pruned(&exact_index_filter("m")));
     }
