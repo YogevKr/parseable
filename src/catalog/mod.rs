@@ -16,7 +16,10 @@
  *
  */
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use chrono::{DateTime, Local, NaiveTime, Utc};
 use column::Column;
@@ -186,6 +189,35 @@ fn create_partition_bounds(lower_bound: DateTime<Utc>) -> (DateTime<Utc>, DateTi
     (partition_lower, partition_upper)
 }
 
+fn manifest_contains_partition(
+    item: &snapshot::ManifestItem,
+    partition_lower: DateTime<Utc>,
+) -> bool {
+    item.time_lower_bound <= partition_lower && partition_lower < item.time_upper_bound
+}
+
+fn manifest_path_matches(item: &snapshot::ManifestItem, manifest_file_name: &str) -> bool {
+    item.manifest_path
+        .trim_end_matches('/')
+        .ends_with(manifest_file_name)
+}
+
+fn manifest_position_for_update(
+    manifests: &[snapshot::ManifestItem],
+    partition_lower: DateTime<Utc>,
+    manifest_file_name: &str,
+) -> Option<usize> {
+    manifests.iter().position(|item| {
+        manifest_contains_partition(item, partition_lower)
+            && manifest_path_matches(item, manifest_file_name)
+    })
+}
+
+fn dedupe_manifest_entries(manifests: &mut Vec<snapshot::ManifestItem>) {
+    let mut seen = HashSet::new();
+    manifests.retain(|item| seen.insert(item.manifest_path.clone()));
+}
+
 /// Extracts statistics from live metrics for a given partition date
 fn extract_partition_metrics(
     stream_name: &str,
@@ -262,9 +294,12 @@ async fn process_single_partition(
     storage_size: u64,
     tenant_id: &Option<String>,
 ) -> Result<Option<snapshot::ManifestItem>, ObjectStorageError> {
-    let pos = meta.snapshot.manifest_list.iter().position(|item| {
-        item.time_lower_bound <= partition_lower && partition_lower < item.time_upper_bound
-    });
+    let manifest_file_name = manifest_path("").to_string();
+    let pos = manifest_position_for_update(
+        &meta.snapshot.manifest_list,
+        partition_lower,
+        &manifest_file_name,
+    );
 
     if let Some(pos) = pos {
         handle_existing_partition(
@@ -388,6 +423,7 @@ async fn finalize_snapshot_update(
 ) -> Result<(), ObjectStorageError> {
     // Add all new manifest entries to the snapshot
     meta.snapshot.manifest_list.extend(new_manifest_entries);
+    dedupe_manifest_entries(&mut meta.snapshot.manifest_list);
 
     let stats = get_current_stats(stream_name, "json", tenant_id);
     if let Some(stats) = stats {
@@ -559,6 +595,74 @@ pub async fn remove_manifest_from_snapshot(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn manifest_item(path: &str) -> snapshot::ManifestItem {
+        snapshot::ManifestItem {
+            manifest_path: path.to_string(),
+            time_lower_bound: Utc.with_ymd_and_hms(2026, 5, 16, 0, 0, 0).unwrap(),
+            time_upper_bound: Utc.with_ymd_and_hms(2026, 5, 16, 23, 59, 59).unwrap(),
+            events_ingested: 0,
+            ingestion_size: 0,
+            storage_size: 0,
+        }
+    }
+
+    #[test]
+    fn update_position_prefers_current_manifest_in_partition() {
+        let manifests = vec![
+            manifest_item("benchmark/date=2026-05-16/old-pod.manifest.json"),
+            manifest_item("benchmark/date=2026-05-16/current-pod.manifest.json"),
+        ];
+        let partition_lower = Utc.with_ymd_and_hms(2026, 5, 16, 6, 0, 0).unwrap();
+
+        let pos =
+            manifest_position_for_update(&manifests, partition_lower, "current-pod.manifest.json");
+
+        assert_eq!(pos, Some(1));
+    }
+
+    #[test]
+    fn update_position_ignores_current_manifest_outside_partition() {
+        let manifests = vec![snapshot::ManifestItem {
+            time_lower_bound: Utc.with_ymd_and_hms(2026, 5, 15, 0, 0, 0).unwrap(),
+            time_upper_bound: Utc.with_ymd_and_hms(2026, 5, 15, 23, 59, 59).unwrap(),
+            ..manifest_item("benchmark/date=2026-05-15/current-pod.manifest.json")
+        }];
+        let partition_lower = Utc.with_ymd_and_hms(2026, 5, 16, 6, 0, 0).unwrap();
+
+        let pos =
+            manifest_position_for_update(&manifests, partition_lower, "current-pod.manifest.json");
+
+        assert_eq!(pos, None);
+    }
+
+    #[test]
+    fn dedupe_manifest_entries_keeps_first_path() {
+        let mut manifests = vec![
+            manifest_item("benchmark/date=2026-05-16/current-pod.manifest.json"),
+            manifest_item("benchmark/date=2026-05-16/current-pod.manifest.json"),
+            manifest_item("benchmark/date=2026-05-16/old-pod.manifest.json"),
+        ];
+
+        dedupe_manifest_entries(&mut manifests);
+
+        assert_eq!(
+            manifests
+                .iter()
+                .map(|item| item.manifest_path.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "benchmark/date=2026-05-16/current-pod.manifest.json",
+                "benchmark/date=2026-05-16/old-pod.manifest.json",
+            ]
+        );
+    }
 }
 
 /// Partition the path to which this manifest belongs.
