@@ -1,0 +1,44 @@
+name: Benchmark amd64 binary
+
+on:
+  push:
+    branches:
+      - benchmark/exact-hash-amd64-build
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-11 g++-11
+
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-x86_64-unknown-linux-gnu-benchmark-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build amd64 binary
+        env:
+          CC: gcc-11
+          CXX: g++-11
+        run: cargo build --target x86_64-unknown-linux-gnu --release
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: parseable-linux-amd64
+          path: target/x86_64-unknown-linux-gnu/release/parseable
+          if-no-files-found: error
