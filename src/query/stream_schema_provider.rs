@@ -37,7 +37,7 @@ use datafusion::{
     error::{DataFusionError, Result as DataFusionResult},
     execution::object_store::ObjectStoreUrl,
     logical_expr::{
-        BinaryExpr, Operator, TableProviderFilterPushDown, TableType, utils::conjunction,
+        Between, BinaryExpr, Operator, TableProviderFilterPushDown, TableType, utils::conjunction,
     },
     physical_expr::{LexOrdering, PhysicalSortExpr, create_physical_expr, expressions::col},
     physical_plan::{ExecutionPlan, Statistics, empty::EmptyExec, union::UnionExec},
@@ -951,6 +951,34 @@ pub trait ManifestExt: ManifestFile {
     }
 
     fn can_be_pruned(&self, partial_filter: &Expr) -> bool {
+        match partial_filter {
+            Expr::BinaryExpr(binary_expr) if binary_expr.op == Operator::And => {
+                return self.can_be_pruned(binary_expr.left.as_ref())
+                    || self.can_be_pruned(binary_expr.right.as_ref());
+            }
+            Expr::BinaryExpr(binary_expr) if binary_expr.op == Operator::Or => {
+                return self.can_be_pruned(binary_expr.left.as_ref())
+                    && self.can_be_pruned(binary_expr.right.as_ref());
+            }
+            Expr::Between(between) if !between.negated => {
+                if let Some(can_prune) = can_prune_between(self.columns(), between) {
+                    return can_prune;
+                }
+                let low = Expr::BinaryExpr(BinaryExpr::new(
+                    between.expr.clone(),
+                    Operator::GtEq,
+                    between.low.clone(),
+                ));
+                let high = Expr::BinaryExpr(BinaryExpr::new(
+                    between.expr.clone(),
+                    Operator::LtEq,
+                    between.high.clone(),
+                ));
+                return self.can_be_pruned(&low) || self.can_be_pruned(&high);
+            }
+            _ => {}
+        }
+
         fn extract_op_scalar(expr: &Expr) -> Option<(Operator, &ScalarValue)> {
             let Expr::BinaryExpr(expr) = expr else {
                 return None;
@@ -1039,6 +1067,30 @@ fn filter_column_name(expr: &Expr) -> Option<&str> {
         Expr::TryCast(cast) => filter_column_name(cast.expr.as_ref()),
         _ => None,
     }
+}
+
+fn can_prune_between(columns: &[Column], between: &Between) -> Option<bool> {
+    let column_name = filter_column_name(between.expr.as_ref())?;
+    let col = columns.iter().find(|col| col.name == column_name)?;
+    let low = literal_cast_or_none(between.low.as_ref())?;
+    let high = literal_cast_or_none(between.high.as_ref())?;
+
+    if let Some(exact_values) = &col.exact_values
+        && exact_values.complete
+        && let Some(any_match) =
+            exact_values_between_may_satisfy(exact_values, low, high, col.stats.as_ref())
+    {
+        return Some(!any_match);
+    }
+
+    None
+}
+
+fn literal_cast_or_none(expr: &Expr) -> Option<CastRes<'_>> {
+    let Expr::Literal(value, None) = expr else {
+        return None;
+    };
+    cast_or_none(value)
 }
 
 fn parquet_scan_batch_size(configured: usize, limit: Option<usize>) -> usize {
@@ -1216,6 +1268,57 @@ fn exact_values_may_satisfy(
     }
 }
 
+fn exact_values_between_may_satisfy(
+    exact_values: &crate::catalog::column::ExactValues,
+    low: CastRes<'_>,
+    high: CastRes<'_>,
+    stats: Option<&TypedStatistics>,
+) -> Option<bool> {
+    match (low, high, stats?) {
+        (CastRes::Bool(low), CastRes::Bool(high), TypedStatistics::Bool(_)) => {
+            exact_values_any_parse_between_match(
+                &exact_values.values,
+                low,
+                high,
+                |raw| raw.parse::<bool>().ok(),
+                |_| true,
+            )
+        }
+        (CastRes::Int(low), CastRes::Int(high), TypedStatistics::Int(_)) => {
+            exact_values_any_parse_between_match(
+                &exact_values.values,
+                low,
+                high,
+                |raw| raw.parse::<i64>().ok(),
+                |_| true,
+            )
+        }
+        (CastRes::Float(low), CastRes::Float(high), TypedStatistics::Float(_))
+            if !low.is_nan() && !high.is_nan() =>
+        {
+            exact_values_any_parse_between_match(
+                &exact_values.values,
+                low,
+                high,
+                |raw| raw.parse::<f64>().ok(),
+                |candidate| !candidate.is_nan(),
+            )
+        }
+        (CastRes::String(low), CastRes::String(high), TypedStatistics::String(_)) => {
+            if low > high {
+                return Some(false);
+            }
+            Some(
+                exact_values
+                    .values
+                    .iter()
+                    .any(|candidate| candidate.as_str() >= low && candidate.as_str() <= high),
+            )
+        }
+        _ => None,
+    }
+}
+
 fn exact_values_any_parse_match<T, F, V>(
     values: &[String],
     query: T,
@@ -1239,6 +1342,34 @@ where
     Some(any_match)
 }
 
+fn exact_values_any_parse_between_match<T, F, V>(
+    values: &[String],
+    low: T,
+    high: T,
+    parse: F,
+    valid: V,
+) -> Option<bool>
+where
+    T: Copy + PartialOrd,
+    F: Fn(&str) -> Option<T>,
+    V: Fn(T) -> bool,
+{
+    if low > high {
+        return Some(false);
+    }
+
+    for raw in values {
+        let candidate = parse(raw)?;
+        if !valid(candidate) {
+            return None;
+        }
+        if candidate >= low && candidate <= high {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
 fn compare_exact<T: PartialOrd + PartialEq>(candidate: T, query: T, op: Operator) -> bool {
     match op {
         Operator::Eq | Operator::IsNotDistinctFrom => candidate == query,
@@ -1257,7 +1388,7 @@ mod tests {
     use arrow_schema::DataType;
     use chrono::{DateTime, Duration, NaiveDate, NaiveDateTime, NaiveTime, Utc};
     use datafusion::{
-        logical_expr::{BinaryExpr, Operator},
+        logical_expr::{Between, BinaryExpr, Operator},
         prelude::Expr,
         scalar::ScalarValue,
     };
@@ -1526,6 +1657,34 @@ mod tests {
         ))
     }
 
+    fn numeric_between_filter(low: i64, high: i64) -> Expr {
+        Expr::Between(Between::new(
+            Box::new(Expr::Cast(datafusion::logical_expr::Cast::new(
+                Box::new(Expr::Column("duration_ms".into())),
+                DataType::Int64,
+            ))),
+            false,
+            Box::new(Expr::Literal(ScalarValue::Int64(Some(low)), None)),
+            Box::new(Expr::Literal(ScalarValue::Int64(Some(high)), None)),
+        ))
+    }
+
+    fn and_filter(left: Expr, right: Expr) -> Expr {
+        Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(left),
+            Operator::And,
+            Box::new(right),
+        ))
+    }
+
+    fn or_filter(left: Expr, right: Expr) -> Expr {
+        Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(left),
+            Operator::Or,
+            Box::new(right),
+        ))
+    }
+
     #[test]
     fn exact_index_prunes_missing_equality_inside_min_max_range() {
         let file = exact_index_file(&["a", "z"], true);
@@ -1646,6 +1805,37 @@ mod tests {
         let file = numeric_exact_index_file(&["100", "not-a-number"], 100, 10_000);
 
         assert!(!file.can_be_pruned(&cast_numeric_filter(1500, Operator::GtEq)));
+    }
+
+    #[test]
+    fn and_filter_prunes_when_any_branch_cannot_match() {
+        let file = exact_index_file(&["a"], true);
+
+        let filter = and_filter(exact_index_filter("missing"), like_filter("%not_indexed%"));
+
+        assert!(file.can_be_pruned(&filter));
+    }
+
+    #[test]
+    fn or_filter_prunes_only_when_all_branches_cannot_match() {
+        let file = exact_index_file(&["a"], true);
+
+        assert!(file.can_be_pruned(&or_filter(
+            exact_index_filter("missing"),
+            exact_index_filter("also_missing")
+        )));
+        assert!(!file.can_be_pruned(&or_filter(
+            exact_index_filter("missing"),
+            exact_index_filter("a")
+        )));
+    }
+
+    #[test]
+    fn between_filter_uses_exact_numeric_index_for_pruning() {
+        let file = numeric_exact_index_file(&["100", "200", "900"], 0, 10_000);
+
+        assert!(file.can_be_pruned(&numeric_between_filter(300, 400)));
+        assert!(!file.can_be_pruned(&numeric_between_filter(150, 250)));
     }
 
     #[test]
