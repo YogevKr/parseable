@@ -537,6 +537,14 @@ pub struct Options {
 
     #[arg(
         long,
+        env = "P_TEXT_INDEX_MAX_HASHES",
+        default_value = "1000000",
+        help = "Maximum distinct hashed ngrams per file and field for text LIKE manifest indexes"
+    )]
+    pub text_index_max_hashes: usize,
+
+    #[arg(
+        long,
         env = "P_MAX_EVENT_PAYLOAD_SIZE",
         default_value = "10485760",
         value_parser = validation::validate_payload_size,

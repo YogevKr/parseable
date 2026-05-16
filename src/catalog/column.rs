@@ -105,6 +105,25 @@ impl TextNgrams {
     }
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TextNgramHashes {
+    pub complete: bool,
+    #[serde(default = "default_text_ngram_min_len")]
+    pub min_len: usize,
+    pub hashes: Vec<u64>,
+}
+
+impl TextNgramHashes {
+    pub fn contains(&self, gram: &str) -> bool {
+        let hash = text_ngram_hash(gram);
+        self.hashes.binary_search(&hash).is_ok()
+    }
+}
+
+pub fn text_ngram_hash(gram: &str) -> u64 {
+    xxhash_rust::xxh3::xxh3_64(gram.as_bytes())
+}
+
 fn default_text_ngram_min_len() -> usize {
     3
 }
@@ -258,6 +277,8 @@ pub struct Column {
     pub exact_hashes: Option<ExactHashes>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text_ngrams: Option<TextNgrams>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_ngram_hashes: Option<TextNgramHashes>,
     pub uncompressed_size: u64,
     pub compressed_size: u64,
 }
