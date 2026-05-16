@@ -989,12 +989,21 @@ pub trait ManifestExt: ManifestFile {
             return false;
         };
 
-        if matches!(op, Operator::Eq | Operator::IsNotDistinctFrom)
-            && let Some(exact_values) = &col.exact_values
+        if let Some(exact_values) = &col.exact_values
             && exact_values.complete
-            && !exact_values.contains(&value.exact_index_key())
         {
-            return true;
+            if matches!(op, Operator::Eq | Operator::IsNotDistinctFrom)
+                && !exact_values.contains(&value.exact_index_key())
+            {
+                return true;
+            }
+
+            if let Some(any_match) =
+                exact_values_may_satisfy(exact_values, value, op, col.stats.as_ref())
+                && !any_match
+            {
+                return true;
+            }
         }
 
         let Some(stats) = &col.stats else {
@@ -1148,6 +1157,80 @@ fn satisfy_constraints(value: CastRes, op: Operator, stats: &TypedStatistics) ->
             matches(val, &stats.min, &stats.max, op)
         }
         _ => None,
+    }
+}
+
+fn exact_values_may_satisfy(
+    exact_values: &crate::catalog::column::ExactValues,
+    value: CastRes<'_>,
+    op: Operator,
+    stats: Option<&TypedStatistics>,
+) -> Option<bool> {
+    match (value, stats?) {
+        (CastRes::Bool(query), TypedStatistics::Bool(_)) => exact_values_any_parse_match(
+            &exact_values.values,
+            query,
+            op,
+            |raw| raw.parse::<bool>().ok(),
+            |_| true,
+        ),
+        (CastRes::Int(query), TypedStatistics::Int(_)) => exact_values_any_parse_match(
+            &exact_values.values,
+            query,
+            op,
+            |raw| raw.parse::<i64>().ok(),
+            |_| true,
+        ),
+        (CastRes::Float(query), TypedStatistics::Float(_)) if !query.is_nan() => {
+            exact_values_any_parse_match(
+                &exact_values.values,
+                query,
+                op,
+                |raw| raw.parse::<f64>().ok(),
+                |candidate| !candidate.is_nan(),
+            )
+        }
+        (CastRes::String(query), TypedStatistics::String(_)) => Some(
+            exact_values
+                .values
+                .iter()
+                .any(|candidate| compare_exact(candidate.as_str(), query, op)),
+        ),
+        _ => None,
+    }
+}
+
+fn exact_values_any_parse_match<T, F, V>(
+    values: &[String],
+    query: T,
+    op: Operator,
+    parse: F,
+    valid: V,
+) -> Option<bool>
+where
+    T: Copy + PartialOrd + PartialEq,
+    F: Fn(&str) -> Option<T>,
+    V: Fn(T) -> bool,
+{
+    let mut any_match = false;
+    for raw in values {
+        let candidate = parse(raw)?;
+        if !valid(candidate) {
+            return None;
+        }
+        any_match |= compare_exact(candidate, query, op);
+    }
+    Some(any_match)
+}
+
+fn compare_exact<T: PartialOrd + PartialEq>(candidate: T, query: T, op: Operator) -> bool {
+    match op {
+        Operator::Eq | Operator::IsNotDistinctFrom => candidate == query,
+        Operator::Lt => candidate < query,
+        Operator::LtEq => candidate <= query,
+        Operator::Gt => candidate > query,
+        Operator::GtEq => candidate >= query,
+        _ => true,
     }
 }
 
@@ -1319,6 +1402,33 @@ mod tests {
         }
     }
 
+    fn numeric_exact_index_file(values: &[&str], min: i64, max: i64) -> File {
+        let mut values = values
+            .iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>();
+        values.sort();
+
+        File {
+            file_path: "file.parquet".to_string(),
+            num_rows: 10,
+            file_size: 10,
+            ingestion_size: 10,
+            columns: vec![Column {
+                name: "duration_ms".to_string(),
+                stats: Some(TypedStatistics::Int(Int64Type { min, max })),
+                exact_values: Some(ExactValues {
+                    complete: true,
+                    values,
+                }),
+                text_ngrams: None,
+                uncompressed_size: 10,
+                compressed_size: 10,
+            }],
+            sort_order_id: Vec::new(),
+        }
+    }
+
     fn cast_numeric_filter(value: i64, op: Operator) -> Expr {
         Expr::BinaryExpr(BinaryExpr::new(
             Box::new(Expr::Cast(datafusion::logical_expr::Cast::new(
@@ -1400,6 +1510,21 @@ mod tests {
 
         assert!(file.can_be_pruned(&cast_numeric_filter(1500, Operator::GtEq)));
         assert!(!file.can_be_pruned(&cast_numeric_filter(300, Operator::GtEq)));
+    }
+
+    #[test]
+    fn complete_exact_index_prunes_numeric_range_inside_broad_min_max() {
+        let file = numeric_exact_index_file(&["100", "200", "300"], 100, 10_000);
+
+        assert!(file.can_be_pruned(&cast_numeric_filter(1500, Operator::GtEq)));
+        assert!(!file.can_be_pruned(&cast_numeric_filter(200, Operator::GtEq)));
+    }
+
+    #[test]
+    fn invalid_numeric_exact_index_value_does_not_prune_range() {
+        let file = numeric_exact_index_file(&["100", "not-a-number"], 100, 10_000);
+
+        assert!(!file.can_be_pruned(&cast_numeric_filter(1500, Operator::GtEq)));
     }
 
     #[test]
